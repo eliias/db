@@ -1,0 +1,8 @@
+DROP TYPE IF EXISTS RATIONALE CASCADE;
+
+DROP FUNCTION IF EXISTS <%= table_name %>_sbt_renormalize;
+DROP FUNCTION IF EXISTS <%= table_name %>_sbt_move_row;
+DROP FUNCTION IF EXISTS <%= table_name %>_sbt_mediant;
+
+DROP TRIGGER IF EXISTS <%= table_name %>initial_channel_position ON <%= table_name %>;
+DROP FUNCTION IF EXISTS <%= table_name %>_calculate_initial_channel_position;

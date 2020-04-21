@@ -1,0 +1,22 @@
+version: "3.7"
+
+services:
+
+  db:
+    image: postgres:12-alpine
+    ports:
+      - 54321:5432
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: db
+      POSTGRES_PASSWORD: db
+      POSTGRES_DB: db
+    restart: "no"
+
+volumes:
+  db-data:
+
+networks:
+  default:
+    name: db

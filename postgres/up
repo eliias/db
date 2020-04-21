@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+docker-compose \
+    -p db \
+    -f db.yml \
+    up

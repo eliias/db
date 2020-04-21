@@ -1,0 +1,255 @@
+-- User-specified sorting with Stern-Brocot Trees
+-- https://wiki.postgresql.org/wiki/User-specified_ordering_with_fractions
+--
+
+-- Custom rationale type, used to represent "true" fractions.
+-- CREATE TYPE RATIONALE AS
+-- (
+--     p INT,
+--     q INT
+-- );
+
+-- find an intermediate fraction between p1/q1 and p2/q2.
+--
+-- The fraction chosen is the highest fraction in the Stern-Brocot
+-- tree which falls strictly between the specified values. This is
+-- intended to avoid going deeper in the tree unnecessarily when the
+-- list is already sparse due to deletion or moving of items, but in
+-- fact the case when the two items are already adjacent in the tree
+-- is common so we shortcut it. As a bonus, this method always
+-- generates fractions in lowest terms, so there is no need for GCD
+-- calculations anywhere.
+--
+-- Inputs must not be null (caller's responsibility), but the value
+-- pos2.p=1 pos2.q=0 is allowed for the upper bound without causing any
+-- division by zero errors.
+CREATE OR REPLACE FUNCTION <%= table_name %>_sbt_mediant(p1 int, q1 int,
+                                                         p2 int, q2 int,
+                                                         OUT p int, OUT q int)
+    LANGUAGE plpgsql
+    immutable strict
+AS
+$f$
+DECLARE
+    pl INTEGER := 0;
+    ql INTEGER := 1;
+    ph INTEGER := 1;
+    qh INTEGER := 0;
+BEGIN
+    IF (p1::BIGINT * q2 + 1) <> (p2::BIGINT * q1) THEN
+        loop
+            p := pl + ph;
+            q := ql + qh;
+            IF (p::BIGINT * q1 <= q::BIGINT * p1) THEN
+                pl := p; ql := q;
+            elsif (p2::BIGINT * q <= q2::BIGINT * p) THEN
+                ph := p; qh := q;
+            ELSE
+                exit;
+            END IF;
+        END loop;
+    ELSE
+        p := p1 + p2;
+        q := q1 + q2;
+    END IF;
+END;
+$f$;
+
+-- move row ROW_ID next to REL_ID,
+-- before it if IS_BEFORE is true, otherwise after. REL_ID may
+-- be null to indicate a position off the end of the list.
+CREATE OR REPLACE FUNCTION <%= table_name %>_sbt_move_row(row_id INTEGER,
+                                                          rel_id INTEGER,
+                                                          is_before BOOLEAN)
+    RETURNS void
+    LANGUAGE plpgsql
+    volatile called ON NULL INPUT
+AS
+$f$
+DECLARE
+    pos1  RATIONALE; -- fraction below insert position
+    pos2  RATIONALE; -- fraction above insert position
+    r_rel DOUBLE PRECISION; -- p/q of the rel_id row
+    np    int; nq int; -- new insert position fraction
+BEGIN
+    -- lock the row
+    PERFORM 1 FROM "<%= table_name %>" WHERE "<%= id_col %>" = row_id FOR UPDATE;
+
+    -- moving a record to its own position is a no-op
+    IF rel_id = row_id THEN RETURN; END IF;
+
+    -- if we're positioning next to a specified row, it must exist
+    IF rel_id IS NOT NULL THEN
+        SELECT (t."<%= pos_col %>").p, (t."<%= pos_col %>").q
+          FROM "<%= table_name %>" t
+          WHERE "<%= id_col %>" = rel_id
+          INTO strict pos1.p, pos1.q;
+        r_rel := pos1.p::float8 / pos1.q;
+    END IF;
+
+    -- find the next adjacent row in the desired direction
+    -- (might not exist).
+    IF is_before THEN
+        pos2.p := pos1.p; pos2.q := pos1.q;
+        SELECT (t2."<%= pos_col %>").p, (t2."<%= pos_col %>").q
+          FROM "<%= table_name %>" t2
+          WHERE "<%= id_col %>" != row_id
+            AND (
+              ("<%= pos_col %>").p::float8 / ("<%= pos_col %>").q) < COALESCE(r_rel, 'infinity')
+          ORDER BY (
+              ("<%= pos_col %>").p::float8 / ("<%= pos_col %>").q)
+          DESC LIMIT 1
+          INTO pos1.p, pos1.q;
+    ELSE
+        SELECT (t3."<%= pos_col %>").p, (t3."<%= pos_col %>").q
+          FROM "<%= table_name %>" t3
+          WHERE "<%= id_col %>" != row_id
+            AND (("<%= pos_col %>").p::float8 / ("<%= pos_col %>").q) > COALESCE(r_rel, 0)
+          ORDER BY (("<%= pos_col %>").p::float8 / ("<%= pos_col %>").q)
+          LIMIT 1
+          INTO pos2.p, pos2.q;
+    END IF;
+
+    -- compute insert fraction
+    SELECT *
+    INTO np, nq
+    FROM <%= table_name %>_sbt_mediant(COALESCE(pos1.p, 0), COALESCE(pos1.q, 1),
+                     COALESCE(pos2.p, 1), COALESCE(pos2.q, 0));
+
+    -- move the specified row
+    UPDATE "<%= table_name %>"
+      SET ("<%= pos_col %>".p, "<%= pos_col %>".q) = (np, nq)
+      WHERE "<%= id_col %>" = row_id;
+
+    -- want to renormalize both to avoid possibility of integer overflow
+    -- and to ensure that distinct fraction values map to distinct float8
+    -- values. Bounding to 10 million gives us reasonable headroom while
+    -- not requiring frequent normalization.
+
+    IF (np > 10000000) OR (nq > 10000000) THEN
+        perform <%= table_name %>_sbt_renormalize();
+    END IF;
+END;
+$f$;
+
+-- Renormalize the fractions of items in TBL, preserving the
+-- existing order. The new fractions are not strictly optimal, but
+-- doing better would require much more complex calculations.
+--
+-- the purpose of the complex update is as follows: we want to assign
+-- a new series of values 1/2, 3/2, 5/2, ... to the existing rows,
+-- maintaining the existing order, but because the unique expression
+-- index is not deferrable, we want to avoid assigning any new value
+-- that collides with an existing one.
+--
+-- We do this by calculating, for each existing row with an x/2 value,
+-- which position in the new sequence it would appear at. This is done
+-- by adjusting the value of p downwards according to the number of
+-- earlier values in sequence. To see why, consider:
+--
+--   existing values:    3, 9,13,15,23
+--   new simple values:  1, 3, 5, 7, 9,11,13,15,17,19,21
+--                          *     *  *        *
+--   adjusted values:    1, 5, 7,11,17,19,21,25,27,29,31
+--
+--   points of adjustment: 3, 7 (9-2), 9 (13-4, 15-6), 15 (23-8)
+--
+-- The * mark the places where an adjustment has to be applied.
+--
+-- Having calculated the adjustment points, the adjusted value is
+-- simply the simple value adjusted upwards according to the number of
+-- points passed (counting multiplicity).
+
+CREATE OR REPLACE FUNCTION <%= table_name %>_sbt_renormalize()
+    RETURNS void
+    LANGUAGE plpgsql
+    volatile strict
+AS
+$f$
+BEGIN
+    -- lock the table
+    SELECT 1 FROM "<%= table_name %>" FOR UPDATE;
+
+    -- normalize
+    UPDATE "<%= table_name %>" c
+      SET"<%= pos_col %>" = (s2.new_rnum, 2)
+        FROM (SELECT "<%= id_col %>",
+                     is_existing = 0 AS is_new,
+                     -- increase the current value according to the
+                     -- number of adjustment points passed
+                     rnum + 2 * (SUM(is_existing)
+                                OVER (ORDER BY rnum))
+                                   AS new_rnum
+              FROM (
+                   -- assign the initial simple values to every item'
+                   -- in order
+                   SELECT "<%= id_col %>",
+                          2 * (ROW_NUMBER()
+                               OVER (ORDER BY ("<%= pos_col %>").p::float8 / ("<%= pos_col %>").q)) -
+                          1
+                              AS rnum,
+                          0   AS is_existing
+                   FROM "<%= table_name %>" t2
+                   UNION ALL
+                   -- and merge in the adjustment points required to
+                   -- skip over existing x/2 values
+                   SELECT "<%= id_col %>",
+                          ("<%= pos_col %>").p + 2 -
+                          2 * (COUNT(*) OVER (ORDER BY ("<%= pos_col %>").p))
+                              AS rnum,
+                          1   AS is_existing
+                   FROM "<%= table_name %>" t3
+                   WHERE ("<%= pos_col %>").q = 2
+              ) s1
+            ) s2
+            WHERE s2."<%= id_col %>" = c."<%= id_col %>"
+              AND s2.is_new;
+END;
+$f$;
+
+CREATE OR REPLACE FUNCTION <%= table_name %>_sbt_initial_row_position()
+    RETURNS TRIGGER
+    LANGUAGE plpgsql
+    volatile called ON NULL INPUT
+AS
+$f$
+DECLARE
+    pos RATIONALE; -- fraction above insert position
+    np  int; nq int; -- new insert position fraction
+BEGIN
+    -- lock the row
+    PERFORM 1 FROM "<%= table_name %>" t
+      WHERE t."<%= id_col %>" = NEW."<%= id_col %>" FOR UPDATE;
+
+    -- find the next adjacent row in the desired direction
+    SELECT (c."<%= pos_col %>").p, (c."<%= pos_col %>").q
+    INTO pos.p, pos.q
+    FROM <%= table_name %> c
+    WHERE c."<%= id_col %>" != NEW."<%= id_col %>"
+      AND (("<%= pos_col %>").p::float8 / ("<%= pos_col %>").q) > 0
+    ORDER BY (("<%= pos_col %>").p::float8 / ("<%= pos_col %>").q) DESC
+    LIMIT 1;
+
+    -- compute insert fraction
+    SELECT *
+    INTO np, nq
+    FROM <%= table_name %>_sbt_mediant(
+      COALESCE(pos.p, 0),
+      COALESCE(pos.q, 1),
+      1,
+      0
+    );
+
+    -- set the position
+    NEW."<%= pos_col %>" = (np, nq);
+
+    RETURN NEW;
+END;
+$f$;
+
+DROP TRIGGER IF EXISTS <%= table_name %>_initial_channel_position ON "<%= table_name %>";
+CREATE TRIGGER <%= table_name %>_initial_channel_position
+  BEFORE INSERT
+  ON "<%= table_name %>"
+  FOR EACH ROW
+EXECUTE PROCEDURE <%= table_name %>_sbt_initial_row_position();
